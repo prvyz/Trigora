@@ -1,227 +1,44 @@
 const https = require('https');
 
 const BOAMP = 'https://www.boamp.fr/api/explore/v2.1/catalog/datasets/boamp_piamp_concentrateur/records';
-// Current tabular API resource for the consolidated DECP parquet exposed by data.gouv.fr.
 const DECP = 'https://tabular-api.data.gouv.fr/api/resources/22847056-61df-452d-837d-8b8ceadbfc52/data/';
 const IDF = new Set(['75','77','78','91','92','93','94','95']);
-
+const TECH = /\b(bâtiment|batiment|construction|travaux|chantier|immeuble|logement|tertiaire|industriel|chaufferie|plomberie|chauffage|climatisation|ventilation|électricité|electricite|courant fort|courant faible|sanitaire|canalisation|réseau|reseau|maintenance technique|multitechnique|exploitation technique|ssi|sécurité incendie|securite incendie)\b/i;
 const KEYWORDS = {
   cvc:['cvc','chauffage','climatisation','ventilation','hvac','thermique'],
   plomberie:['plomberie','plombier','sanitaire','canalisation','eau potable'],
   electricite:['électricité','electricite','électrique','electrique','courant fort','courant faible','hta','basse tension','haute tension'],
-  maintenance:['maintenance','entretien','exploitation technique','multitechnique','exploitation-maintenance']
+  maintenance:['maintenance technique','maintenance multitechnique','exploitation technique','exploitation-maintenance','installations techniques','entretien technique']
 };
-
-function str(v){ return v == null ? '' : String(v); }
-function first(r,names){
-  const keys = Object.keys(r || {});
-  for(const n of names){
-    const k = keys.find(x => x.toLowerCase() === n.toLowerCase());
-    if(k && r[k] != null && r[k] !== '') return r[k];
-  }
-  for(const n of names){
-    const k = keys.find(x => x.toLowerCase().includes(n.toLowerCase()));
-    if(k && r[k] != null && r[k] !== '') return r[k];
-  }
-  return null;
+function str(v){return v==null?'':String(v);}
+function first(r,names){const keys=Object.keys(r||{});for(const n of names){const k=keys.find(x=>x.toLowerCase()===n.toLowerCase());if(k&&r[k]!=null&&r[k]!=='')return r[k];}for(const n of names){const k=keys.find(x=>x.toLowerCase().includes(n.toLowerCase()));if(k&&r[k]!=null&&r[k]!=='')return r[k];}return null;}
+function num(v){if(v==null)return null;if(typeof v==='number')return Number.isFinite(v)?v:null;const s=str(v).replace(/\s/g,'').replace(/€/g,'').replace(/,/g,'.').replace(/[^0-9.\-]/g,'');const n=Number(s);return Number.isFinite(n)?n:null;}
+function parseJson(v){if(typeof v!=='string')return v;try{return JSON.parse(v);}catch{return null;}}
+function flatten(v,out=[]){if(v==null)return out;if(Array.isArray(v)){v.forEach(x=>flatten(x,out));return out;}if(typeof v==='object'){Object.entries(v).forEach(([k,x])=>{out.push([k,str(x)]);flatten(x,out);});}return out;}
+function nestedFirst(r,keys){const p=parseJson(r?.donnees);if(!p)return null;const w=keys.map(x=>x.toLowerCase());for(const [k,v] of flatten(p))if(w.some(x=>k.toLowerCase().includes(x))){const n=num(v);if(n!=null)return n;}return null;}
+function text(r){return [first(r,['objet','object','title','intitule','description','objet_du_marche']),first(r,['descripteur_libelle','famille_libelle','cpv','type_marche']),first(r,['nomacheteur','acheteur','acheteur_nom','acheteur_nom_officiel','organisme']),first(r,['ville','commune','acheteur_ville','lieu_execution'])].map(str).join(' ');}
+function sector(t){const x=str(t).toLowerCase();for(const [s,ws] of Object.entries(KEYWORDS))if(ws.some(w=>x.includes(w)))return s;return null;}
+function region(r){const deps=[first(r,['code_departement','code_departement_prestation','acheteur_code_departement']),first(r,['codepostal','code_postal','acheteur_code_postal','cp'])].filter(Boolean).map(str);if(deps.some(d=>IDF.has(d.padStart(2,'0').slice(0,2))))return 'Île-de-France';const t=text(r).toLowerCase();if(/\bparis\b|\bversailles\b|\bboulogne[- ]billancourt\b|\bnanterre\b|\bcréteil\b|\bcreteil\b|\bévry\b|\bevry\b|\bcorbeil[- ]essonnes\b|\bmelun\b|\bmontreuil\b|\bsarcelles\b|\bcergy\b|\bsaint[- ]denis\b/.test(t))return 'Île-de-France';return null;}
+function eventType(r){const n=str(first(r,['nature','nature_libelle','type_avis','type','modification_type'])).toLowerCase();if(n.includes('attribution')||n.includes('résultat')||n.includes('resultat')||n.includes('decp'))return'attribution';if(n.includes('annulation'))return'annulation';if(n.includes('rectificatif'))return'rectificatif';if(n.includes('avis de marché')||n.includes('appel d’offres')||n.includes("appel d'offres")||n.includes('appel'))return'appel_offres';return n||'autre';}
+function score(r){const t=text(r);const sec=sector(t);const reg=region(r);const evt=eventType(r);const amount=num(first(r,['montant','amount','montant_ht','value','valeur']))??nestedFirst(r,['montant','valeur','value']);const duration=str(first(r,['duree','duration','duree_mois','dureeMois']))||null;const winner=first(r,['titulaire','winner','contractor','entreprise','titulaire_nom','attributaire','titulaire_denomination']);const buyer=first(r,['nomacheteur','acheteur','organisme','acheteur_nom','acheteur_nom_officiel']);let points=0,reasons=[],evidence=0;
+  if(!sec)return{score:0,evidence:0,confidence:'low',facts:{event_type:evt,sector:null,region:reg,amount_eur:amount,duration,winner:str(winner)||null,buyer:str(buyer)||null,reasons:['hors verticale TRIGORA']}};
+  if(sec==='maintenance'&&!TECH.test(t))return{score:0,evidence:0,confidence:'low',facts:{event_type:evt,sector:null,region:reg,amount_eur:amount,duration,winner:str(winner)||null,buyer:str(buyer)||null,reasons:['maintenance non technique / hors wedge']}};
+  points+=30;evidence++;reasons.push('activité technique ciblée');
+  if(reg){points+=20;evidence++;reasons.push('zone Île-de-France');}
+  if(evt==='attribution'){points+=25;evidence++;reasons.push('marché attribué');}else if(evt==='appel_offres'){points+=15;evidence++;reasons.push('opportunité active');}
+  if(amount!=null){if(amount>=1e6)points+=15;else if(amount>=5e5)points+=12;else if(amount>=1e5)points+=8;else if(amount>=4e4)points+=4;if(amount>=1e5){evidence++;reasons.push('montant significatif');}}
+  if(duration){points+=4;evidence++;reasons.push('durée renseignée');}
+  if(winner){points+=4;evidence++;reasons.push('titulaire identifiable');}
+  if(buyer){points+=2;evidence++;reasons.push('acheteur identifiable');}
+  if(first(r,['idweb','id','uid','filename'])){points+=2;evidence++;reasons.push('source traçable');}
+  const final=Math.min(points,100);return{score:final,evidence,confidence:final>=80&&evidence>=4?'high':final>=65&&evidence>=3?'medium':'low',facts:{event_type:evt,sector:sec,region:reg,amount_eur:amount,duration,winner:str(winner)||null,buyer:str(buyer)||null,reasons}};
 }
-function num(v){
-  if(v == null) return null;
-  if(typeof v === 'number') return Number.isFinite(v) ? v : null;
-  const s = str(v).replace(/\s/g,'').replace(/€/g,'').replace(/,/g,'.').replace(/[^0-9.\-]/g,'');
-  const n = Number(s);
-  return Number.isFinite(n) ? n : null;
-}
-function parseJson(v){ if(typeof v !== 'string') return v; try { return JSON.parse(v); } catch { return null; } }
-function flattenValues(v, out=[]){
-  if(v == null) return out;
-  if(Array.isArray(v)){ for(const x of v) flattenValues(x,out); return out; }
-  if(typeof v === 'object'){ for(const [k,x] of Object.entries(v)){ out.push([k,str(x)]); flattenValues(x,out); } return out; }
-  return out;
-}
-function nestedFirst(r, keys){
-  const parsed = parseJson(r?.donnees);
-  if(!parsed) return null;
-  const wanted = keys.map(x=>x.toLowerCase());
-  for(const [k,v] of flattenValues(parsed)) if(wanted.some(w=>k.toLowerCase().includes(w))){ const n=num(v); if(n!=null) return n; }
-  return null;
-}
-function sector(text){
-  const t = str(text).toLowerCase();
-  for(const [s,ws] of Object.entries(KEYWORDS)) if(ws.some(w=>t.includes(w))) return s;
-  return null;
-}
-function region(r){
-  const depValues = [
-    first(r,['code_departement','code_departement_prestation','acheteur_code_departement']),
-    first(r,['codepostal','code_postal','acheteur_code_postal','cp'])
-  ].filter(Boolean).map(str);
-  if(depValues.some(d => IDF.has(d.padStart(2,'0').slice(0,2)))) return 'Île-de-France';
-  const locationText = [
-    first(r,['nomacheteur','acheteur','acheteur_nom','organisme']),
-    first(r,['ville','commune','acheteur_ville','lieu_execution']),
-    first(r,['code_departement','code_departement_prestation'])
-  ].map(str).join(' ').toLowerCase();
-  if(/\bparis\b|\bversailles\b/.test(locationText)) return 'Île-de-France';
-  return null;
-}
-function eventType(r){
-  const n = str(first(r,['nature','nature_libelle','type_avis','type','modification_type'])).toLowerCase();
-  if(n.includes('attribution') || n.includes('résultat') || n.includes('resultat') || n.includes('decp')) return 'attribution';
-  if(n.includes('annulation')) return 'annulation';
-  if(n.includes('rectificatif')) return 'rectificatif';
-  if(n.includes('avis de marché') || n.includes('appel d’offres') || n.includes("appel d'offres") || n.includes('appel')) return 'appel_offres';
-  return n || 'autre';
-}
-function confidence(score, evidenceCount){
-  if(score >= 80 && evidenceCount >= 4) return 'high';
-  if(score >= 65 && evidenceCount >= 3) return 'medium';
-  return 'low';
-}
-function score(r){
-  const title = str(first(r,['objet','object','title','intitule','description','objet_du_marche']));
-  const searchable = [title, first(r,['descripteur_libelle','famille_libelle','cpv','type_marche'])].map(str).join(' ');
-  const sec = sector(searchable);
-  const reg = region(r);
-  const amount = num(first(r,['montant','amount','montant_ht','value','valeur'])) ?? nestedFirst(r,['montant','valeur','value']);
-  const duration = str(first(r,['duree','duration','duree_mois','dureeMois'])) || null;
-  const evt = eventType(r);
-  const winner = first(r,['titulaire','winner','contractor','entreprise','titulaire_nom','attributaire','titulaire_denomination']);
-  const buyer = first(r,['nomacheteur','acheteur','organisme','acheteur_nom','acheteur_nom_officiel']);
-  let points = 0, reasons=[], evidence=0;
-  if(sec){ points += 25; evidence++; reasons.push('activité ciblée'); }
-  if(reg){ points += 15; evidence++; reasons.push('zone Île-de-France'); }
-  if(evt === 'attribution'){ points += 25; evidence++; reasons.push('marché déjà attribué'); }
-  else if(evt === 'appel_offres'){ points += 10; evidence++; reasons.push('opportunité active'); }
-  if(amount != null){
-    if(amount>=1e6) points += 20;
-    else if(amount>=5e5) points += 16;
-    else if(amount>=1e5) points += 10;
-    else if(amount>=4e4) points += 5;
-    if(amount>=5e5){ evidence++; reasons.push('montant significatif'); }
-  }
-  if(duration){ points += 5; evidence++; reasons.push('durée renseignée'); }
-  if(winner){ points += 5; evidence++; reasons.push('entreprise gagnante identifiable'); }
-  if(buyer){ points += 3; evidence++; reasons.push('acheteur identifiable'); }
-  if(first(r,['idweb','id','uid','filename'])){ points += 2; evidence++; reasons.push('source traçable'); }
-  const finalScore = Math.min(points,100);
-  return {score:finalScore, evidence, confidence:confidence(finalScore,evidence), facts:{event_type:evt,sector:sec,region:reg,amount_eur:amount,duration,winner:str(winner)||null,buyer:str(buyer)||null,reasons}};
-}
-
-function inferIntent(f){
-  const intents=[];
-  const evidence=[];
-  if(f.event_type === 'attribution') { intents.push('capacité opérationnelle / sous-traitance'); evidence.push('contrat attribué'); }
-  if(f.amount_eur >= 500000) { intents.push('BFR / financement'); evidence.push('montant >= 500 k€'); }
-  if(f.duration && /\d/.test(f.duration)) { intents.push('recrutement / renfort opérationnel'); evidence.push('durée contractuelle'); }
-  if(['cvc','plomberie','electricite','maintenance'].includes(f.sector)) { intents.push('logiciel / gestion BTP'); evidence.push('verticale technique'); }
-  if(f.region === 'Île-de-France') { intents.push('fournisseurs / prestataires locaux'); evidence.push('zone IDF'); }
-  const confidenceScore = Math.min(95, 35 + evidence.length * 12 + (f.event_type==='attribution'?12:0) + (f.amount_eur>=500000?10:0));
-  return { intents:[...new Set(intents)].slice(0,5), confidence:confidenceScore, evidence, caveat:'Hypothèse commerciale : le signal indique un besoin potentiel, pas un besoin confirmé.' };
-}
-
-function partnerMatches(f, intents){
-  const matches=[];
-  if(intents.some(x=>x.includes('logiciel'))) matches.push({category:'SaaS BTP',reason:'gestion opérationnelle potentiellement pertinente',priority:3});
-  if(intents.some(x=>x.includes('recrutement'))) matches.push({category:'RH / staffing',reason:'besoin potentiel de capacité',priority:3});
-  if(intents.some(x=>x.includes('financement'))) matches.push({category:'financement B2B',reason:'contrat significatif pouvant créer un besoin de trésorerie',priority:2});
-  if(intents.some(x=>x.includes('sous-traitance'))) matches.push({category:'réseau de sous-traitants',reason:'contrat attribué et capacité à absorber',priority:3});
-  if(intents.some(x=>x.includes('fournisseurs'))) matches.push({category:'fournisseurs / équipements',reason:'activité locale ciblée',priority:2});
-  return matches.sort((a,b)=>b.priority-a.priority);
-}
-
-function normalizeDecp(r){
-  return {
-    idweb:first(r,['uid','id','marche_id','idweb']),
-    nature:'Attribution DECP',
-    objet:first(r,['objet','objet_du_marche','description']),
-    code_departement:first(r,['code_departement','acheteur_code_departement']),
-    montant:first(r,['montant','montant_ht']),
-    dureeMois:first(r,['dureeMois','duree_mois']),
-    titulaire_nom:first(r,['titulaire_nom','titulaire_denomination']),
-    titulaire_siret:first(r,['titulaire_siret']),
-    acheteur_nom:first(r,['acheteur_nom','acheteur_nom_officiel']),
-    acheteur_id:first(r,['acheteur_id']),
-    dateNotification:first(r,['dateNotification','date_notification']),
-    datePublicationDonnees:first(r,['datePublicationDonnees','date_publication_donnees'])
-  };
-}
-
-function build(records, source='BOAMP'){
-  const now = new Date().toISOString();
-  return records.map((r,i)=>{
-    const q = score(r);
-    if(q.score < 50) return null;
-    const idweb = str(first(r,['idweb','id','uid','filename'])) || String(i+1);
-    const intent = inferIntent(q.facts);
-    const matches = partnerMatches(q.facts,intent.intents);
-    return {
-      id:`trigora-${source.toLowerCase()}-${idweb.replace(/[^a-zA-Z0-9_-]/g,'-')}`,
-      detected_at:now,
-      score:q.score,
-      confidence:q.confidence,
-      company:q.facts.winner,
-      buyer:q.facts.buyer,
-      siret:str(first(r,['titulaire_siret','siret','contractor_siret','siren'])) || null,
-      title:str(first(r,['objet','object','title','intitule','description','objet_du_marche'])) || 'Marché public',
-      published_at:str(first(r,['dateparution','date_publication','date','dateNotification','date_notification'])) || null,
-      facts:q.facts,
-      intent,
-      match:{recommended:matches.slice(0,3)},
-      monetization:{status:'not_connected',expected_revenue_eur:null},
-      source:{system:source,dataset:source==='DECP'?'decp_consolide':'boamp_piamp_concentrateur',idweb:idweb,url:str(first(r,['url_avis','safe_url_avis','url'])) || null,source_type:'open_public_data'}
-    };
-  }).filter(Boolean).sort((a,b)=>b.score-a.score);
-}
-
-function getJson(url, headers={}){
-  return new Promise((resolve,reject)=>{
-    const req = https.get(url,{headers:{'User-Agent':'TRIGORA/1.2',...headers}},res=>{
-      let body=''; res.on('data',d=>body+=d); res.on('end',()=>{
-        if(res.statusCode>=200&&res.statusCode<300){
-          try { resolve(JSON.parse(body)); } catch(e){ reject(new Error('Invalid JSON from '+new URL(url).hostname)); }
-        } else reject(new Error(new URL(url).hostname+' HTTP '+res.statusCode));
-      });
-    });
-    req.on('error',reject); req.setTimeout(8000,()=>req.destroy(new Error(new URL(url).hostname+' timeout')));
-  });
-}
-
-function fetchBoamp(limit=100){
-  const params = new URLSearchParams({limit:String(limit),order_by:'dateparution desc'});
-  return getJson(BOAMP+'?'+params.toString()).then(x=>x.results||[]);
-}
-
-function fetchDecp(limit=100){
-  const params = new URLSearchParams({
-    page_size:String(Math.min(limit,100)),
-    dateNotification__greater:'2026-08-01',
-    donneesActuelles__exact:'true'
-  });
-  return getJson(DECP+'?'+params.toString()).then(x=>x.data || x.results || []);
-}
-
-module.exports = async (req,res)=>{
-  try{
-    const limit = Math.min(Math.max(Number(req.query.limit||100),1),100);
-    const requestedSource = str(req.query.source || 'both').toLowerCase();
-    let boamp=[], decp=[];
-    const tasks=[];
-    if(requestedSource==='boamp' || requestedSource==='both') tasks.push(fetchBoamp(limit).then(x=>{boamp=x;}));
-    if(requestedSource==='decp' || requestedSource==='both') tasks.push(fetchDecp(limit).then(x=>{decp=x;}));
-    const settled = await Promise.allSettled(tasks);
-    const errors = settled.filter(x=>x.status==='rejected').map(x=>x.reason.message);
-    const boampSignals = build(boamp,'BOAMP');
-    const decpSignals = build(decp.map(normalizeDecp),'DECP');
-    const signals = [...boampSignals,...decpSignals].sort((a,b)=>b.score-a.score).slice(0,100);
-    res.statusCode=200;
-    res.setHeader('Content-Type','application/json; charset=utf-8');
-    res.setHeader('Cache-Control','s-maxage=300, stale-while-revalidate=600');
-    res.end(JSON.stringify({generated_at:new Date().toISOString(),source:requestedSource,source_records:{BOAMP:boamp.length,DECP:decp.length},signal_count:signals.length,upstream_errors:errors,signals}));
-  }catch(e){
-    res.statusCode=502; res.setHeader('Content-Type','application/json; charset=utf-8');
-    res.end(JSON.stringify({error:'upstream_unavailable',message:e.message}));
-  }
-};
-
-module.exports._test = {build,score,inferIntent,partnerMatches,normalizeDecp};
+function inferIntent(f){const intents=[],evidence=[];if(f.event_type==='attribution'){intents.push('capacité opérationnelle / sous-traitance');evidence.push('contrat attribué');}if(f.amount_eur>=500000){intents.push('BFR / financement');evidence.push('montant >= 500 k€');}if(f.duration&&/\d/.test(f.duration)){intents.push('recrutement / renfort opérationnel');evidence.push('durée contractuelle');}if(['cvc','plomberie','electricite','maintenance'].includes(f.sector)){intents.push('logiciel / gestion BTP');evidence.push('verticale technique');}if(f.region==='Île-de-France'){intents.push('fournisseurs / prestataires locaux');evidence.push('zone IDF');}return{intents:[...new Set(intents)].slice(0,5),confidence:Math.min(95,35+evidence.length*12+(f.event_type==='attribution'?12:0)+(f.amount_eur>=500000?10:0)),evidence,caveat:'Hypothèse commerciale : le signal indique un besoin potentiel, pas un besoin confirmé.'};}
+function partnerMatches(f,intents){const m=[];if(intents.some(x=>x.includes('logiciel')))m.push({category:'SaaS BTP',reason:'gestion opérationnelle potentiellement pertinente',priority:3});if(intents.some(x=>x.includes('recrutement')))m.push({category:'RH / staffing',reason:'besoin potentiel de capacité',priority:3});if(intents.some(x=>x.includes('financement')))m.push({category:'financement B2B',reason:'contrat significatif pouvant créer un besoin de trésorerie',priority:2});if(intents.some(x=>x.includes('sous-traitance')))m.push({category:'réseau de sous-traitants',reason:'contrat attribué et capacité à absorber',priority:3});if(intents.some(x=>x.includes('fournisseurs')))m.push({category:'fournisseurs / équipements',reason:'activité locale ciblée',priority:2});return m.sort((a,b)=>b.priority-a.priority);}
+function normalizeDecp(r){return{uid:first(r,['uid','id','marche_id','idweb']),nature:'Attribution DECP',objet:first(r,['objet','objet_du_marche','description']),code_departement:first(r,['code_departement','acheteur_code_departement','departement']),code_postal:first(r,['code_postal','acheteur_code_postal','cp']),ville:first(r,['ville','acheteur_ville','commune']),montant:first(r,['montant','montant_ht']),dureeMois:first(r,['dureeMois','duree_mois']),titulaire_nom:first(r,['titulaire_nom','titulaire_denomination']),titulaire_siret:first(r,['titulaire_siret']),acheteur_nom:first(r,['acheteur_nom','acheteur_nom_officiel']),acheteur_id:first(r,['acheteur_id']),dateNotification:first(r,['dateNotification','date_notification']),datePublicationDonnees:first(r,['datePublicationDonnees','date_publication_donnees'])};}
+function build(records,source='BOAMP'){const now=new Date().toISOString();const seen=new Set();return records.map((r,i)=>{const q=score(r);if(q.score<55)return null;if(q.facts.region!=='Île-de-France')return null;const rawId=str(first(r,['idweb','id','uid','filename']))||String(i+1);const key=[source,rawId,q.facts.winner||'',q.facts.title||''].join('|').toLowerCase();if(seen.has(key))return null;seen.add(key);const intent=inferIntent(q.facts);const matches=partnerMatches(q.facts,intent.intents);return{id:`trigora-${source.toLowerCase()}-${rawId.replace(/[^a-zA-Z0-9_-]/g,'-')}-${i}`,detected_at:now,score:q.score,confidence:q.confidence,company:q.facts.winner,buyer:q.facts.buyer,siret:str(first(r,['titulaire_siret','siret','contractor_siret','siren']))||null,title:str(first(r,['objet','object','title','intitule','description','objet_du_marche']))||'Marché public'),published_at:str(first(r,['dateparution','date_publication','date','dateNotification','date_notification']))||null,facts:q.facts,intent,match:{recommended:matches.slice(0,3)},monetization:{status:'not_connected',expected_revenue_eur:null},source:{system:source,dataset:source==='DECP'?'decp_consolide':'boamp_piamp_concentrateur',idweb:rawId,url:str(first(r,['url_avis','safe_url_avis','url']))||null,source_type:'open_public_data'}};}).filter(Boolean).sort((a,b)=>b.score-a.score);}
+function getJson(url){return new Promise((resolve,reject)=>{const req=https.get(url,{headers:{'User-Agent':'TRIGORA/1.3'}},res=>{let body='';res.on('data',d=>body+=d);res.on('end',()=>{if(res.statusCode>=200&&res.statusCode<300){try{resolve(JSON.parse(body));}catch{reject(new Error('Invalid JSON from '+new URL(url).hostname));}}else reject(new Error(new URL(url).hostname+' HTTP '+res.statusCode));});});req.on('error',reject);req.setTimeout(8000,()=>req.destroy(new Error(new URL(url).hostname+' timeout')));});}
+function fetchBoamp(limit){return getJson(BOAMP+'?'+new URLSearchParams({limit:String(limit),order_by:'dateparution desc'})).then(x=>x.results||[]);}
+function fetchDecp(limit){return getJson(DECP+'?'+new URLSearchParams({page_size:String(Math.min(limit,100)),dateNotification__greater:'2026-08-01',donneesActuelles__exact:'true'})).then(x=>x.data||x.results||[]);}
+module.exports=async(req,res)=>{try{const limit=Math.min(Math.max(Number(req.query.limit||100),1),100);const source=str(req.query.source||'both').toLowerCase();let boamp=[],decp=[];const tasks=[];if(source==='boamp'||source==='both')tasks.push(fetchBoamp(limit).then(x=>{boamp=x;}));if(source==='decp'||source==='both')tasks.push(fetchDecp(limit).then(x=>{decp=x;}));const settled=await Promise.allSettled(tasks);const errors=settled.filter(x=>x.status==='rejected').map(x=>x.reason.message);const a=build(boamp,'BOAMP'),b=build(decp.map(normalizeDecp),'DECP');const signals=[...a,...b].sort((x,y)=>y.score-x.score).slice(0,100);res.statusCode=200;res.setHeader('Content-Type','application/json; charset=utf-8');res.setHeader('Cache-Control','s-maxage=300, stale-while-revalidate=600');res.end(JSON.stringify({generated_at:new Date().toISOString(),source,scope:'Île-de-France / technique BTP',source_records:{BOAMP:boamp.length,DECP:decp.length},signal_count:signals.length,upstream_errors:errors,signals}));}catch(e){res.statusCode=502;res.setHeader('Content-Type','application/json; charset=utf-8');res.end(JSON.stringify({error:'upstream_unavailable',message:e.message}));}};
+module.exports._test={build,score,inferIntent,partnerMatches,normalizeDecp};
