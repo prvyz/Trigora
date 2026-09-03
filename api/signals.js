@@ -1,14 +1,14 @@
 const https = require('https');
 
-// Public BOAMP dataset (OpenDataSoft v2.1).
 const BOAMP = 'https://www.boamp.fr/api/explore/v2.1/catalog/datasets/boamp_piamp_concentrateur/records';
-const DECP = 'https://www.data.gouv.fr/api/1/datasets/donnees-essentielles-de-la-commande-publique-donnees-enrichies';
+// Current tabular API resource for the consolidated DECP parquet exposed by data.gouv.fr.
+const DECP = 'https://tabular-api.data.gouv.fr/api/resources/22847056-61df-452d-837d-8b8ceadbfc52/data/';
 const IDF = new Set(['75','77','78','91','92','93','94','95']);
 
 const KEYWORDS = {
   cvc:['cvc','chauffage','climatisation','ventilation','hvac','thermique'],
   plomberie:['plomberie','plombier','sanitaire','canalisation','eau potable'],
-  electricite:['électricité','electricite','électrique','electrique','courant fort','courant faible','hta','bt'],
+  electricite:['électricité','electricite','électrique','electrique','courant fort','courant faible','hta','basse tension','haute tension'],
   maintenance:['maintenance','entretien','exploitation technique','multitechnique','exploitation-maintenance']
 };
 
@@ -46,21 +46,28 @@ function nestedFirst(r, keys){
   for(const [k,v] of flattenValues(parsed)) if(wanted.some(w=>k.toLowerCase().includes(w))){ const n=num(v); if(n!=null) return n; }
   return null;
 }
-function sector(t){
-  t = t.toLowerCase();
+function sector(text){
+  const t = str(text).toLowerCase();
   for(const [s,ws] of Object.entries(KEYWORDS)) if(ws.some(w=>t.includes(w))) return s;
   return null;
 }
 function region(r){
-  const deps = [].concat(r.code_departement || [], r.code_departement_prestation || []).map(str);
-  if(deps.some(d=>IDF.has(d))) return 'Île-de-France';
-  const t = Object.values(r).map(str).join(' ').toLowerCase();
-  if(/\bparis\b/.test(t) || /\bversailles\b/.test(t)) return 'Île-de-France';
+  const depValues = [
+    first(r,['code_departement','code_departement_prestation','acheteur_code_departement']),
+    first(r,['codepostal','code_postal','acheteur_code_postal','cp'])
+  ].filter(Boolean).map(str);
+  if(depValues.some(d => IDF.has(d.padStart(2,'0').slice(0,2)))) return 'Île-de-France';
+  const locationText = [
+    first(r,['nomacheteur','acheteur','acheteur_nom','organisme']),
+    first(r,['ville','commune','acheteur_ville','lieu_execution']),
+    first(r,['code_departement','code_departement_prestation'])
+  ].map(str).join(' ').toLowerCase();
+  if(/\bparis\b|\bversailles\b/.test(locationText)) return 'Île-de-France';
   return null;
 }
 function eventType(r){
-  const n = str(first(r,['nature','nature_libelle','type_avis','type'])).toLowerCase();
-  if(n.includes('attribution') || n.includes('résultat') || n.includes('resultat')) return 'attribution';
+  const n = str(first(r,['nature','nature_libelle','type_avis','type','modification_type'])).toLowerCase();
+  if(n.includes('attribution') || n.includes('résultat') || n.includes('resultat') || n.includes('decp')) return 'attribution';
   if(n.includes('annulation')) return 'annulation';
   if(n.includes('rectificatif')) return 'rectificatif';
   if(n.includes('avis de marché') || n.includes('appel d’offres') || n.includes("appel d'offres") || n.includes('appel')) return 'appel_offres';
@@ -72,15 +79,15 @@ function confidence(score, evidenceCount){
   return 'low';
 }
 function score(r){
-  const title = str(first(r,['objet','object','title','intitule','description']));
-  const blob = title+' '+Object.values(r).map(str).join(' ');
-  const sec = sector(blob);
+  const title = str(first(r,['objet','object','title','intitule','description','objet_du_marche']));
+  const searchable = [title, first(r,['descripteur_libelle','famille_libelle','cpv','type_marche'])].map(str).join(' ');
+  const sec = sector(searchable);
   const reg = region(r);
   const amount = num(first(r,['montant','amount','montant_ht','value','valeur'])) ?? nestedFirst(r,['montant','valeur','value']);
   const duration = str(first(r,['duree','duration','duree_mois','dureeMois'])) || null;
   const evt = eventType(r);
-  const winner = first(r,['titulaire','winner','contractor','entreprise','titulaire_nom','attributaire']);
-  const buyer = first(r,['nomacheteur','acheteur','organisme','acheteur_nom']);
+  const winner = first(r,['titulaire','winner','contractor','entreprise','titulaire_nom','attributaire','titulaire_denomination']);
+  const buyer = first(r,['nomacheteur','acheteur','organisme','acheteur_nom','acheteur_nom_officiel']);
   let points = 0, reasons=[], evidence=0;
   if(sec){ points += 25; evidence++; reasons.push('activité ciblée'); }
   if(reg){ points += 15; evidence++; reasons.push('zone Île-de-France'); }
@@ -96,8 +103,9 @@ function score(r){
   if(duration){ points += 5; evidence++; reasons.push('durée renseignée'); }
   if(winner){ points += 5; evidence++; reasons.push('entreprise gagnante identifiable'); }
   if(buyer){ points += 3; evidence++; reasons.push('acheteur identifiable'); }
-  if(first(r,['idweb','id','filename'])){ points += 2; evidence++; reasons.push('source traçable'); }
-  return {score:Math.min(points,100), evidence, confidence:confidence(Math.min(points,100),evidence), facts:{event_type:evt,sector:sec,region:reg,amount_eur:amount,duration,winner:str(winner)||null,buyer:str(buyer)||null,reasons}};
+  if(first(r,['idweb','id','uid','filename'])){ points += 2; evidence++; reasons.push('source traçable'); }
+  const finalScore = Math.min(points,100);
+  return {score:finalScore, evidence, confidence:confidence(finalScore,evidence), facts:{event_type:evt,sector:sec,region:reg,amount_eur:amount,duration,winner:str(winner)||null,buyer:str(buyer)||null,reasons}};
 }
 
 function inferIntent(f){
@@ -124,18 +132,18 @@ function partnerMatches(f, intents){
 
 function normalizeDecp(r){
   return {
-    idweb: first(r,['uid','id','marche_id']) || first(r,['idweb']),
-    nature: 'Attribution DECP',
-    objet: first(r,['objet','objet_du_marche','description']),
-    code_departement: first(r,['code_departement','acheteur_code_departement']),
-    montant: first(r,['montant','montant_ht']),
-    dureeMois: first(r,['dureeMois','duree_mois']),
-    titulaire_nom: first(r,['titulaire_nom','titulaire_denomination']),
-    titulaire_siret: first(r,['titulaire_siret']),
-    acheteur_nom: first(r,['acheteur_nom','acheteur_nom_officiel']),
-    acheteur_id: first(r,['acheteur_id']),
-    dateNotification: first(r,['dateNotification','date_notification']),
-    datePublicationDonnees: first(r,['datePublicationDonnees','date_publication_donnees'])
+    idweb:first(r,['uid','id','marche_id','idweb']),
+    nature:'Attribution DECP',
+    objet:first(r,['objet','objet_du_marche','description']),
+    code_departement:first(r,['code_departement','acheteur_code_departement']),
+    montant:first(r,['montant','montant_ht']),
+    dureeMois:first(r,['dureeMois','duree_mois']),
+    titulaire_nom:first(r,['titulaire_nom','titulaire_denomination']),
+    titulaire_siret:first(r,['titulaire_siret']),
+    acheteur_nom:first(r,['acheteur_nom','acheteur_nom_officiel']),
+    acheteur_id:first(r,['acheteur_id']),
+    dateNotification:first(r,['dateNotification','date_notification']),
+    datePublicationDonnees:first(r,['datePublicationDonnees','date_publication_donnees'])
   };
 }
 
@@ -144,51 +152,72 @@ function build(records, source='BOAMP'){
   return records.map((r,i)=>{
     const q = score(r);
     if(q.score < 50) return null;
-    const idweb = str(first(r,['idweb','id','filename'])) || String(i+1);
+    const idweb = str(first(r,['idweb','id','uid','filename'])) || String(i+1);
     const intent = inferIntent(q.facts);
     const matches = partnerMatches(q.facts,intent.intents);
     return {
-      id:`trigora-${idweb.replace(/[^a-zA-Z0-9_-]/g,'-')}`,
+      id:`trigora-${source.toLowerCase()}-${idweb.replace(/[^a-zA-Z0-9_-]/g,'-')}`,
       detected_at:now,
       score:q.score,
       confidence:q.confidence,
       company:q.facts.winner,
       buyer:q.facts.buyer,
       siret:str(first(r,['titulaire_siret','siret','contractor_siret','siren'])) || null,
-      title:str(first(r,['objet','object','title','intitule','description'])) || 'Marché public',
-      published_at:str(first(r,['dateparution','date_publication','date'])) || null,
+      title:str(first(r,['objet','object','title','intitule','description','objet_du_marche'])) || 'Marché public',
+      published_at:str(first(r,['dateparution','date_publication','date','dateNotification','date_notification'])) || null,
       facts:q.facts,
       intent,
       match:{recommended:matches.slice(0,3)},
       monetization:{status:'not_connected',expected_revenue_eur:null},
-      source:{system:source,dataset:source==='DECP'?'decp_augmente':'boamp_piamp_concentrateur',idweb:idweb,url:str(first(r,['url_avis','safe_url_avis','url'])) || null,source_type:'open_public_data'}
+      source:{system:source,dataset:source==='DECP'?'decp_consolide':'boamp_piamp_concentrateur',idweb:idweb,url:str(first(r,['url_avis','safe_url_avis','url'])) || null,source_type:'open_public_data'}
     };
   }).filter(Boolean).sort((a,b)=>b.score-a.score);
 }
 
-function fetchJson(limit=100){
+function getJson(url, headers={}){
   return new Promise((resolve,reject)=>{
-    const params = new URLSearchParams({limit:String(limit),order_by:'dateparution desc'});
-    const url = BOAMP+'?'+params.toString();
-    const req = https.get(url,{headers:{'User-Agent':'TRIGORA/1.1'}},res=>{
+    const req = https.get(url,{headers:{'User-Agent':'TRIGORA/1.2',...headers}},res=>{
       let body=''; res.on('data',d=>body+=d); res.on('end',()=>{
-        if(res.statusCode>=200&&res.statusCode<300){ try { resolve(JSON.parse(body).results || []); } catch(e){ reject(new Error('BOAMP invalid JSON')); } }
-        else reject(new Error('BOAMP HTTP '+res.statusCode));
+        if(res.statusCode>=200&&res.statusCode<300){
+          try { resolve(JSON.parse(body)); } catch(e){ reject(new Error('Invalid JSON from '+new URL(url).hostname)); }
+        } else reject(new Error(new URL(url).hostname+' HTTP '+res.statusCode));
       });
     });
-    req.on('error',reject); req.setTimeout(15000,()=>req.destroy(new Error('BOAMP timeout')));
+    req.on('error',reject); req.setTimeout(8000,()=>req.destroy(new Error(new URL(url).hostname+' timeout')));
   });
+}
+
+function fetchBoamp(limit=100){
+  const params = new URLSearchParams({limit:String(limit),order_by:'dateparution desc'});
+  return getJson(BOAMP+'?'+params.toString()).then(x=>x.results||[]);
+}
+
+function fetchDecp(limit=100){
+  const params = new URLSearchParams({
+    page_size:String(Math.min(limit,100)),
+    dateNotification__greater:'2026-08-01',
+    donneesActuelles__exact:'true'
+  });
+  return getJson(DECP+'?'+params.toString()).then(x=>x.data || x.results || []);
 }
 
 module.exports = async (req,res)=>{
   try{
     const limit = Math.min(Math.max(Number(req.query.limit||100),1),100);
-    const records = await fetchJson(limit);
-    const signals = build(records, 'BOAMP');
+    const requestedSource = str(req.query.source || 'both').toLowerCase();
+    let boamp=[], decp=[];
+    const tasks=[];
+    if(requestedSource==='boamp' || requestedSource==='both') tasks.push(fetchBoamp(limit).then(x=>{boamp=x;}));
+    if(requestedSource==='decp' || requestedSource==='both') tasks.push(fetchDecp(limit).then(x=>{decp=x;}));
+    const settled = await Promise.allSettled(tasks);
+    const errors = settled.filter(x=>x.status==='rejected').map(x=>x.reason.message);
+    const boampSignals = build(boamp,'BOAMP');
+    const decpSignals = build(decp.map(normalizeDecp),'DECP');
+    const signals = [...boampSignals,...decpSignals].sort((a,b)=>b.score-a.score).slice(0,100);
     res.statusCode=200;
     res.setHeader('Content-Type','application/json; charset=utf-8');
     res.setHeader('Cache-Control','s-maxage=300, stale-while-revalidate=600');
-    res.end(JSON.stringify({generated_at:new Date().toISOString(),source:'BOAMP',source_records:records.length,signal_count:signals.length,signals}));
+    res.end(JSON.stringify({generated_at:new Date().toISOString(),source:requestedSource,source_records:{BOAMP:boamp.length,DECP:decp.length},signal_count:signals.length,upstream_errors:errors,signals}));
   }catch(e){
     res.statusCode=502; res.setHeader('Content-Type','application/json; charset=utf-8');
     res.end(JSON.stringify({error:'upstream_unavailable',message:e.message}));
